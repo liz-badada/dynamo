@@ -1,33 +1,27 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
 
-"""Phase 2: Disaggregated Diffusion Orchestrator
+"""Disaggregated Diffusion Orchestrator — HTTP Server
 
-Connects to the three stage workers (Encoder, Denoiser, VAE) via Dynamo
-RPC and chains them into an end-to-end image generation pipeline.
-
-This plays the same role as the Frontend/Global Router in the EPD
-architecture, but implemented as a lightweight client for the POC.
+Persistent server that accepts video generation requests and chains
+Encoder → Denoiser → VAE via Dynamo RPC + NIXL RDMA.
 
 Usage:
-    # Ensure the three workers are already running (see launch/run_all.sh)
-    python run_disagg.py \\
-        --prompt "A photo of a cat sitting on a windowsill" \\
-        --output /tmp/disagg_output.png
+    python run_disagg.py [--port 8080]
+
+API:
+    POST /v1/videos/generations
+    GET  /health
+    GET  /videos/<filename>
+
+Curl example:
+    curl -X POST http://localhost:8080/v1/videos/generations \\
+        -H "Content-Type: application/json" \\
+        -d '{"prompt": "A cat walking on grass", "num_inference_steps": 10}'
 """
 
+import argparse
 import asyncio
 import base64
 import json
@@ -35,130 +29,148 @@ import logging
 import os
 import sys
 import time
+import uuid
+from typing import Any, Dict, Optional
 
 import uvloop
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "phase1_workers"))
 
-from protocol import (  # noqa: E402
-    DenoiserRequest,
-    EncoderRequest,
-    VAEDecodeRequest,
-)
-
+from protocol import DenoiserRequest, EncoderRequest, VAEDecodeRequest  # noqa: E402
 from dynamo.runtime import DistributedRuntime, dynamo_worker  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-PROMPT = os.environ.get("PROMPT", "A photo of a cat sitting on a windowsill")
-MODEL = os.environ.get("MODEL_PATH", "black-forest-labs/FLUX.1-schnell")
-OUTPUT = os.environ.get("OUTPUT", "/tmp/disagg_output.png")
-HEIGHT = int(os.environ.get("HEIGHT", "512"))
-WIDTH = int(os.environ.get("WIDTH", "512"))
-NUM_STEPS = int(os.environ.get("NUM_STEPS", "4"))
-SEED = int(os.environ.get("SEED", "42"))
+PORT = int(os.environ.get("PORT", "8080"))
+HOST = os.environ.get("HOST", "0.0.0.0")
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/tmp/disagg_videos")
 
 
 async def call_stage(client, request_json: str) -> dict:
-    """Call a Dynamo endpoint, collect the streamed response.
-
-    Each stage worker yields exactly one response dict.
-    """
     result = None
     stream = await client.generate(request_json)
     async for chunk in stream:
-        # Dynamo streams return objects with a .data() method or raw dicts
         data = chunk.data() if hasattr(chunk, "data") else chunk
         if isinstance(data, str):
             data = json.loads(data)
         result = data
-
     if result is None:
         raise RuntimeError("Empty response from stage")
     return result
 
 
-@dynamo_worker()
+@dynamo_worker(enable_nats=False)
 async def worker(runtime: DistributedRuntime):
-    """Orchestrator: chain Encoder → Denoiser → VAE."""
+    ns = runtime.namespace("disagg_diffusion")
+    encoder_client = await ns.component("encoder").endpoint("generate").client()
+    denoiser_client = await ns.component("denoiser").endpoint("generate").client()
+    vae_client = await ns.component("vae").endpoint("generate").client()
 
-    # Create clients to the three stage endpoints
-    encoder_client = await runtime.endpoint(
-        "disagg_diffusion.encoder.generate"
-    ).client()
-    denoiser_client = await runtime.endpoint(
-        "disagg_diffusion.denoiser.generate"
-    ).client()
-    vae_client = await runtime.endpoint(
-        "disagg_diffusion.vae.generate"
-    ).client()
+    logger.info("Waiting for stage workers …")
+    await encoder_client.wait_for_instances()
+    await denoiser_client.wait_for_instances()
+    await vae_client.wait_for_instances()
+    logger.info("All 3 stage workers connected")
 
-    logger.info("Connected to all three stage endpoints")
-    timings = {}
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # ── Stage 1: Encoder ─────────────────────────────────────────────
-    logger.info("[1/3] Encoding prompt …")
-    t0 = time.monotonic()
+    async def handle_generate(request: dict) -> dict:
+        request_id = str(uuid.uuid4())[:8]
+        seed = request.get("seed") or int(time.time()) % 1000000
+        timings: Dict[str, float] = {}
 
-    encoder_req = EncoderRequest(prompt=PROMPT, model=MODEL)
-    encoder_resp = await call_stage(encoder_client, encoder_req.model_dump_json())
+        t0 = time.monotonic()
+        enc_req = EncoderRequest(
+            prompt=request["prompt"],
+            negative_prompt=request.get("negative_prompt", "Blurry, low quality, distorted"),
+            guidance_scale=request.get("guidance_scale", 5.0),
+        )
+        enc_resp = await call_stage(encoder_client, enc_req.model_dump_json())
+        timings["encoder_s"] = round(time.monotonic() - t0, 3)
+        logger.info("[%s] Encoder: %.2fs", request_id, timings["encoder_s"])
 
-    timings["encoder_s"] = time.monotonic() - t0
-    logger.info("  Done in %.2fs — shapes: %s", timings["encoder_s"], encoder_resp.get("shapes"))
+        t0 = time.monotonic()
+        den_req = DenoiserRequest(
+            transfer_meta=enc_resp["transfer_meta"],
+            height=request.get("height", 480),
+            width=request.get("width", 832),
+            num_frames=request.get("num_frames", 17),
+            num_inference_steps=request.get("num_inference_steps", 20),
+            guidance_scale=request.get("guidance_scale", 5.0),
+            seed=seed,
+        )
+        den_resp = await call_stage(denoiser_client, den_req.model_dump_json())
+        timings["denoiser_s"] = round(time.monotonic() - t0, 3)
+        logger.info("[%s] Denoiser: %.2fs", request_id, timings["denoiser_s"])
 
-    # ── Stage 2: Denoiser ────────────────────────────────────────────
-    logger.info("[2/3] Denoising %dx%d, %d steps …", WIDTH, HEIGHT, NUM_STEPS)
-    t0 = time.monotonic()
+        t0 = time.monotonic()
+        vae_req = VAEDecodeRequest(transfer_meta=den_resp["transfer_meta"])
+        vae_resp = await call_stage(vae_client, vae_req.model_dump_json())
+        timings["vae_s"] = round(time.monotonic() - t0, 3)
+        timings["total_s"] = round(sum(timings.values()), 3)
+        logger.info("[%s] VAE: %.2fs | Total: %.2fs", request_id, timings["vae_s"], timings["total_s"])
 
-    denoiser_req = DenoiserRequest(
-        embeddings_b64=encoder_resp["embeddings_b64"],
-        model=MODEL,
-        height=HEIGHT,
-        width=WIDTH,
-        num_inference_steps=NUM_STEPS,
-        guidance_scale=0.0,
-        seed=SEED,
-    )
-    denoiser_resp = await call_stage(denoiser_client, denoiser_req.model_dump_json())
+        video_b64 = vae_resp["video_b64"]
+        resp_format = request.get("response_format", "url")
 
-    timings["denoiser_s"] = time.monotonic() - t0
-    logger.info("  Done in %.2fs — latent shape: %s", timings["denoiser_s"], denoiser_resp.get("shape"))
+        if resp_format == "url":
+            filename = f"{request_id}.mp4"
+            filepath = os.path.join(OUTPUT_DIR, filename)
+            with open(filepath, "wb") as f:
+                f.write(base64.b64decode(video_b64))
+            data = [{"url": f"/videos/{filename}"}]
+        else:
+            data = [{"b64_json": video_b64}]
 
-    # ── Stage 3: VAE Decode ──────────────────────────────────────────
-    logger.info("[3/3] VAE decoding …")
-    t0 = time.monotonic()
+        return {
+            "id": f"video-{request_id}",
+            "created": int(time.time()),
+            "data": data,
+            "timings": timings,
+        }
 
-    vae_req = VAEDecodeRequest(
-        latents_b64=denoiser_resp["latents_b64"],
-        model=MODEL,
-    )
-    vae_resp = await call_stage(vae_client, vae_req.model_dump_json())
+    # --- HTTP server using aiohttp (lightweight, runs in same event loop) ---
+    from aiohttp import web
 
-    timings["vae_s"] = time.monotonic() - t0
-    logger.info("  Done in %.2fs", timings["vae_s"])
+    async def handle_post(http_request: web.Request) -> web.Response:
+        try:
+            body = await http_request.json()
+            result = await handle_generate(body)
+            return web.json_response(result)
+        except Exception as e:
+            logger.error("Request failed: %s", e, exc_info=True)
+            return web.json_response({"error": str(e)}, status=500)
 
-    # ── Save output ──────────────────────────────────────────────────
-    image_bytes = base64.b64decode(vae_resp["image_b64"])
-    with open(OUTPUT, "wb") as f:
-        f.write(image_bytes)
+    async def handle_health(http_request: web.Request) -> web.Response:
+        return web.json_response({"status": "ok"})
 
-    timings["total_s"] = sum(timings.values())
+    async def handle_video(http_request: web.Request) -> web.Response:
+        filename = http_request.match_info["filename"]
+        filepath = os.path.join(OUTPUT_DIR, filename)
+        if not os.path.exists(filepath):
+            return web.json_response({"error": "not found"}, status=404)
+        return web.FileResponse(filepath, headers={"Content-Type": "video/mp4"})
 
-    logger.info("")
-    logger.info("=" * 50)
-    logger.info("Pipeline complete!")
-    logger.info("  Encoder:  %.2fs", timings["encoder_s"])
-    logger.info("  Denoiser: %.2fs", timings["denoiser_s"])
-    logger.info("  VAE:      %.2fs", timings["vae_s"])
-    logger.info("  Total:    %.2fs", timings["total_s"])
-    logger.info("  Output:   %s", OUTPUT)
-    logger.info("=" * 50)
+    http_app = web.Application()
+    http_app.router.add_post("/v1/videos/generations", handle_post)
+    http_app.router.add_get("/health", handle_health)
+    http_app.router.add_get("/videos/{filename}", handle_video)
+
+    runner = web.AppRunner(http_app)
+    await runner.setup()
+    site = web.TCPSite(runner, HOST, PORT)
+    await site.start()
+
+    logger.info("Server listening on http://%s:%d", HOST, PORT)
+    logger.info("  POST /v1/videos/generations")
+    logger.info("  GET  /health")
+    logger.info("  GET  /videos/<id>.mp4")
+
+    # Keep alive forever
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s %(message)s")
     uvloop.install()
     asyncio.run(worker())

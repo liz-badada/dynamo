@@ -1,59 +1,111 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
 
 """Protocol types for disaggregated diffusion stages.
 
-These Pydantic models define the request/response contracts between
-Encoder, Denoiser, and VAE workers.  Tensor payloads are serialized
-as base64-encoded torch.save bytes.  For production use, replace with
-shared-memory or object-store references.
+Uses NIXL RDMA for GPU-direct tensor transfer between stage workers.
+Only small metadata (shapes, dtypes, NIXL descriptor) travels over Dynamo RPC.
 """
 
-import base64
-import io
+import logging
 from typing import Any, Dict, List, Optional
 
 import torch
 from pydantic import BaseModel
 
+import dynamo.nixl_connect as nixl_connect
+
+logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
-# Tensor serialization helpers
+# NIXL sender / receiver
 # ---------------------------------------------------------------------------
 
-def tensor_to_b64(t: torch.Tensor) -> str:
-    buf = io.BytesIO()
-    torch.save(t.cpu(), buf)
-    return base64.b64encode(buf.getvalue()).decode("ascii")
+class NixlTensorSender:
+    """Registers tensors as NIXL-readable. Produces metadata for the receiver.
+
+    The readable is kept alive as a background task so the generator
+    can complete immediately after yielding metadata (avoiding deadlock
+    with the orchestrator's stream drain).
+    """
+
+    def __init__(self):
+        self._connector = nixl_connect.Connector()
+        self._pending_task: Optional[Any] = None
+
+    async def prepare(
+        self,
+        tensors: Dict[str, torch.Tensor],
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> dict:
+        """Register tensors and return metadata_dict.
+
+        The NIXL readable is kept alive in a background task.
+        The caller should yield the metadata_dict in its response and
+        then return — no need to await anything.
+        """
+        import asyncio
+
+        flat = torch.cat([t.contiguous().view(-1) for t in tensors.values()])
+        descriptor = nixl_connect.Descriptor(flat)
+        readable = await self._connector.create_readable(descriptor)
+        raw_meta = readable.metadata()
+
+        meta_dict = {
+            "tensor_keys": list(tensors.keys()),
+            "shapes": {k: list(t.shape) for k, t in tensors.items()},
+            "dtypes": {k: str(t.dtype).removeprefix("torch.") for k, t in tensors.items()},
+            "nixl_metadata": raw_meta.model_dump() if hasattr(raw_meta, "model_dump") else raw_meta,
+            "extra": extra or {},
+        }
+
+        async def _keep_alive():
+            """Background task that keeps readable/descriptor/flat alive."""
+            try:
+                await readable.wait_for_completion()
+            except Exception as e:
+                logger.warning("NIXL readable wait failed: %s", e)
+
+        self._pending_task = asyncio.ensure_future(_keep_alive())
+        return meta_dict
 
 
-def b64_to_tensor(s: str, device: str = "cuda") -> torch.Tensor:
-    raw = base64.b64decode(s)
-    return torch.load(io.BytesIO(raw), weights_only=True).to(device)
+class NixlTensorReceiver:
+    """Pulls tensors from a remote sender via NIXL RDMA."""
 
+    def __init__(self):
+        self._connector = nixl_connect.Connector()
 
-def tensors_to_b64(tensors: Dict[str, torch.Tensor]) -> str:
-    buf = io.BytesIO()
-    cpu_tensors = {k: v.cpu() for k, v in tensors.items()}
-    torch.save(cpu_tensors, buf)
-    return base64.b64encode(buf.getvalue()).decode("ascii")
+    async def pull(self, meta: dict, device: str = "cuda") -> tuple:
+        """Pull tensors described by meta. Returns (tensors_dict, extra_dict)."""
+        total_bytes = 0
+        specs = []
+        for key in meta["tensor_keys"]:
+            shape = meta["shapes"][key]
+            dtype = getattr(torch, meta["dtypes"][key])
+            numel = 1
+            for s in shape:
+                numel *= s
+            size = numel * dtype.itemsize
+            specs.append((key, shape, dtype, size))
+            total_bytes += size
 
+        flat = torch.empty(total_bytes, dtype=torch.uint8, device="cpu")
+        descriptor = nixl_connect.Descriptor(flat)
 
-def b64_to_tensors(s: str, device: str = "cuda") -> Dict[str, torch.Tensor]:
-    raw = base64.b64decode(s)
-    data = torch.load(io.BytesIO(raw), weights_only=True)
-    return {k: v.to(device) for k, v in data.items()}
+        rdma_meta = nixl_connect.RdmaMetadata.model_validate(meta["nixl_metadata"])
+        read_op = await self._connector.begin_read(rdma_meta, descriptor)
+        await read_op.wait_for_completion()
+
+        result = {}
+        offset = 0
+        for key, shape, dtype, size in specs:
+            t = flat[offset : offset + size].view(dtype=dtype).reshape(shape)
+            result[key] = t.to(device)
+            offset += size
+
+        return result, meta.get("extra", {})
 
 
 # ---------------------------------------------------------------------------
@@ -62,13 +114,13 @@ def b64_to_tensors(s: str, device: str = "cuda") -> Dict[str, torch.Tensor]:
 
 class EncoderRequest(BaseModel):
     prompt: str
-    model: str = "black-forest-labs/FLUX.1-schnell"
+    negative_prompt: str = "Blurry, low quality, distorted"
+    guidance_scale: float = 5.0
 
 
 class EncoderResponse(BaseModel):
-    """Serialized text embeddings."""
-    embeddings_b64: str  # base64(torch.save({prompt_embeds, pooled_prompt_embeds, text_ids}))
-    shapes: Dict[str, List[int]]
+    transfer_meta: Dict[str, Any]
+    shapes: Dict[str, List[int]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -76,19 +128,18 @@ class EncoderResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 class DenoiserRequest(BaseModel):
-    embeddings_b64: str
-    model: str = "black-forest-labs/FLUX.1-schnell"
-    height: int = 512
-    width: int = 512
-    num_inference_steps: int = 4
-    guidance_scale: float = 0.0
+    transfer_meta: Dict[str, Any]
+    height: int = 480
+    width: int = 832
+    num_frames: int = 17
+    num_inference_steps: int = 20
+    guidance_scale: float = 5.0
     seed: int = 42
 
 
 class DenoiserResponse(BaseModel):
-    """Serialized denoised latents."""
-    latents_b64: str  # base64(torch.save({latents, scaling_factor, shift_factor}))
-    shape: List[int]
+    transfer_meta: Dict[str, Any]
+    shape: List[int] = []
 
 
 # ---------------------------------------------------------------------------
@@ -96,32 +147,24 @@ class DenoiserResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 class VAEDecodeRequest(BaseModel):
-    latents_b64: str
-    model: str = "black-forest-labs/FLUX.1-schnell"
+    transfer_meta: Dict[str, Any]
 
 
 class VAEDecodeResponse(BaseModel):
-    """Final output image."""
-    image_b64: Optional[str] = None  # base64 PNG
-    url: Optional[str] = None
+    video_b64: str = ""
+    num_frames: int = 0
 
 
 # ---------------------------------------------------------------------------
-# End-to-end (for orchestrator convenience)
+# End-to-end (orchestrator convenience)
 # ---------------------------------------------------------------------------
 
 class GenerateRequest(BaseModel):
     prompt: str
-    model: str = "black-forest-labs/FLUX.1-schnell"
-    height: int = 512
-    width: int = 512
-    num_inference_steps: int = 4
-    guidance_scale: float = 0.0
+    negative_prompt: str = "Blurry, low quality, distorted"
+    height: int = 480
+    width: int = 832
+    num_frames: int = 17
+    num_inference_steps: int = 20
+    guidance_scale: float = 5.0
     seed: int = 42
-    response_format: str = "b64_json"
-
-
-class GenerateResponse(BaseModel):
-    image_b64: Optional[str] = None
-    url: Optional[str] = None
-    timings: Optional[Dict[str, float]] = None

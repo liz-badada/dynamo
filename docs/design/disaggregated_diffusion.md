@@ -13,55 +13,67 @@ Current diffusion inference in Dynamo (e.g., SGLang backend) is monolithic: a si
 
 **Goal**: Decompose the diffusion pipeline into flexible, independent stages (Encoder, Denoiser, VAE) that can be deployed on different hardware and scaled independently.
 
-## 2. Architecture: Router-Orchestrated Multi-Stage Pipeline
+## 2. Architecture
 
-We adopt a **Router-Centric** architecture similar to Dynamo's existing EPD (Encoder-Prefill-Decode) flow for LLMs. The Frontend/Router acts as the orchestrator, chaining calls between specialized workers.
+### 2.1 Orchestration Design Choice
 
-### 2.1 Component Roles
+Two candidate architectures were evaluated:
 
-1.  **Frontend / Global Router**:
-    *   Acts as the conductor.
+| | Centralized Orchestrator | Decoupled Message Queue |
+|---|---|---|
+| **Pattern** | Frontend/Router chains stages sequentially | Stages communicate via MQ (e.g., NATS/Kafka) |
+| **Pros** | Smart routing (load-aware, affinity); full request lifecycle visibility; straightforward cancel/timeout; centralized metrics; easy to reason about ordering | Loose coupling; stages scale independently; easy to add/remove workers without coordinator change |
+| **Cons** | Orchestrator is a bottleneck/SPOF; tighter coupling | Hard to implement cancel propagation; no global request view; ordering/retry complexity; harder to collect end-to-end metrics |
+
+**Decision: Centralized Orchestrator** — the benefits of request lifecycle management, cancel support, and metrics observability outweigh the coupling cost. This aligns with Dynamo's existing Frontend/Router model for LLM disaggregation (EPD).
+
+### 2.2 Component Roles
+
+1.  **Orchestrator (Frontend / Router)**:
     *   Receives the initial user request.
-    *   Orchestrates the sequence: `Encoder -> Denoiser -> VAE`.
-    *   Maintains the request state and context.
+    *   Orchestrates the sequence: `Encoder → Denoiser → VAE`.
+    *   Owns the full request lifecycle: tracking, cancellation, metrics, timeout.
+    *   Routes each stage to the best available worker instance.
 
 2.  **Stage Workers**:
-    *   **Encoder Worker**: Loads CLIP/T5. Input: Text. Output: Embeddings (Tensor Bytes).
-    *   **Denoiser Worker**: Loads Transformer/UNet. Input: Embeddings + Latents (optional). Output: Denoised Latents.
-    *   **VAE Worker**: Loads VAE. Input: Denoised Latents. Output: Image/Video (Pixel Data).
+    *   **Encoder Worker**: Loads UMT5/CLIP+T5. Input: Text. Output: Embeddings via NIXL RDMA.
+    *   **Denoiser Worker**: Loads Transformer/UNet. Input: Embeddings (NIXL). Output: Latents via NIXL RDMA.
+    *   **VAE Worker**: Loads VAE. Input: Latents (NIXL). Output: Video/Image bytes.
 
-### 2.2 Data Flow (Request/Response)
+### 2.3 Data Flow
 
 ```mermaid
 sequenceDiagram
     participant Client
-    participant Frontend
-    participant Router
-    participant EncoderWorker
-    participant DenoiserWorker
-    participant VAEWorker
+    participant Orchestrator as Orchestrator / Frontend
+    participant EncoderWorker as Encoder (GPU 0)
+    participant DenoiserWorker as Denoiser (GPU 1)
+    participant VAEWorker as VAE (GPU 2)
 
-    Client->>Frontend: POST /v1/images/generations (Prompt)
-    
-    Note over Frontend: Step 1: Text Encoding
-    Frontend->>Router: Route(ModelType.Encoder, Prompt)
-    Router->>EncoderWorker: GenerateEmbeddings(Prompt)
-    EncoderWorker-->>Frontend: Return {prompt_embeds, pooled_embeds}
-    
-    Note over Frontend: Step 2: Denoising
-    Frontend->>Router: Route(ModelType.Denoiser, Embeddings)
-    Router->>DenoiserWorker: Denoise(Embeddings, Latents=None)
-    DenoiserWorker-->>Frontend: Return {denoised_latents}
-    
-    Note over Frontend: Step 3: VAE Decoding
-    Frontend->>Router: Route(ModelType.VAE, Latents)
-    Router->>VAEWorker: Decode(Latents)
-    VAEWorker-->>Frontend: Return {image_data / url}
-    
-    Frontend-->>Client: Final Response
+    Client->>Orchestrator: POST /v1/videos/generations (Prompt)
+
+    Note over Orchestrator: Step 1: Text Encoding
+    Orchestrator->>EncoderWorker: Encode(prompt)
+    Note over EncoderWorker: encode_prompt() → NIXL register readable
+    EncoderWorker-->>Orchestrator: {nixl_metadata, shapes}
+
+    Note over Orchestrator: Step 2: Denoising
+    Orchestrator->>DenoiserWorker: Denoise(nixl_metadata, params)
+    Note over DenoiserWorker: NIXL RDMA pull embeddings from Encoder
+    Note over DenoiserWorker: Denoising loop (N steps)
+    Note over DenoiserWorker: NIXL register latents readable
+    DenoiserWorker-->>Orchestrator: {nixl_metadata, latent_shape}
+
+    Note over Orchestrator: Step 3: VAE Decode
+    Orchestrator->>VAEWorker: Decode(nixl_metadata)
+    Note over VAEWorker: NIXL RDMA pull latents from Denoiser
+    Note over VAEWorker: VAE decode → video frames
+    VAEWorker-->>Orchestrator: {video_b64}
+
+    Orchestrator-->>Client: Final Response
 ```
 
-*Optimization Note*: For large data (like Video Latents), we can use **Reference Passing** via a shared storage (Object Store / Shared Memory) instead of passing raw bytes through the Router/Frontend.
+**Key**: Tensor data (embeddings ~3.6 MB, latents ~1.4 MB) transfers GPU→GPU via NIXL RDMA. Only small metadata (~1.5 KB) travels through the orchestrator's RPC channel.
 
 ## 3. Detailed Design
 
@@ -180,24 +192,47 @@ three stage endpoints in sequence, and produces the final image.
 
 ### Production Roadmap
 
-#### Phase 3: Protocol & Types
-1.  Define `DiffusionEmbeddingData` and `DiffusionLatentData` in `dynamo/common/protocols`.
-2.  Add `DiffusionEncoder`, `DiffusionDenoiser`, `DiffusionVAE` to `ModelType` enum (Rust + Python).
+#### P0: Core Production Readiness
 
-#### Phase 4: SGLang Modularization
-1.  Modify `init_diffusion.py` to accept `--diffusion-stage {full,encoder,denoiser,vae}`.
-2.  Implement `EncoderHandler`, `DenoiserHandler`, `VAEHandler` in `sglang/request_handlers/disagg_diffusion/`.
-3.  Add logic to conditionally load model components based on stage.
+**1. Transfer Engine**
 
-#### Phase 5: Frontend / Router Orchestration
-1.  Update `Frontend` to detect if the backend is disaggregated diffusion.
-2.  Implement the multi-step orchestration logic (`Encoder → Denoiser → VAE`)
-    in `Frontend` or a specialized `DiffusionOrchestrator` component.
-3.  Support configurable stage DAGs (e.g., skip VAE for latent-only output).
+The current POC creates a new NIXL `Connector` per operation. Production needs:
+-   Evaluate whether to pre-allocate receiver buffers and manage a buffer pool (like `NixlPersistentEmbeddingReceiver` in multimodal EPD), or let NIXL handle allocation.
+-   Add pipeline overlap to hide transfer latency: while request N is denoising, request N+1's embeddings should already be transferring.
+-   Reference: `components/src/dynamo/common/multimodal/embedding_transfer.py` (`PersistentConnector`, pooled descriptors).
 
-#### Phase 6: Optimization
-1.  **Reference Passing**: Replace base64 tensor payloads with shared-memory
-    handles or object-store URLs (e.g., `media_output_fs_url`).
-2.  **Pipelining**: Overlap encoding of request N+1 with denoising of request N.
-3.  **Encoder Caching**: LRU cache for repeated prompts at the Encoder stage.
-4.  **Video Extension**: Extend to video models (larger latents, more frames).
+**2. SGLang Handler Integration**
+
+Replace the standalone diffusers workers with SGLang-integrated handlers:
+-   Key design question: does each stage need its own batching/scheduling logic, or can we reuse SGLang's `DiffGenerator` engine?  `DiffGenerator` currently loads the full pipeline — upstream changes are needed for stage-level loading.
+-   Reference: vLLM omni integration with Dynamo for how a backend engine is wrapped with batching + scheduling.
+-   Implementation: `--diffusion-stage {encoder,denoiser,vae}` flag → `EncoderHandler` / `DenoiserHandler` / `VAEHandler` subclassing `BaseGenerativeHandler`.
+-   Consider whether each stage's handler granularity matches SGLang's scheduler or whether a custom lightweight scheduler (request queue + max concurrency) is sufficient.
+
+**3. Orchestrator → Router/Frontend Integration**
+
+Move orchestrator logic into the Dynamo Router or Frontend for full request lifecycle management:
+-   **Role design**: Does each stage need a distinct `ModelType` / role (e.g., `DiffusionEncoder`, `DiffusionDenoiser`, `DiffusionVAE`) for routing, or a single `DiffusionStage` type with a stage parameter?
+-   **Cancel propagation**: When a client cancels, the orchestrator must cancel in-flight stage calls and release NIXL resources. Design cancel token propagation across the 3-stage chain.
+-   **Metrics**: End-to-end latency, per-stage latency, NIXL transfer time, queue depth per stage. Integrate with Dynamo's Prometheus pipeline.
+-   **Timeout / retry**: Per-stage timeout with overall request deadline. Failed stages should not leave NIXL resources leaked.
+-   Add `DiffusionEncoder`, `DiffusionDenoiser`, `DiffusionVAE` to `ModelType` enum (Rust + Python).
+
+#### P1: Advanced Features
+
+**1. Streaming**
+
+Support streaming intermediate results (e.g., progress updates during denoising, partial frame decode). Align with OpenAI streaming response format for video generation.
+
+**2. Chunk-wise Transfer**
+
+For high-resolution video (e.g., 1280×720, 81+ frames), latents can be tens to hundreds of MB. Implement chunk-wise NIXL transfer to reduce peak memory and enable pipelining within a single request (decode chunk K while transferring chunk K+1).
+
+**3. Smart Routing**
+
+-   **Cache-aware routing**: Route repeated prompts to the same encoder worker to leverage encoder-side LRU cache. Route similar latent shapes to the same VAE worker for CUDA graph reuse.
+-   **Load-aware routing**: Route denoising requests to the least-loaded GPU based on queue depth and estimated step time.
+
+**4. Dynamic Scaling**
+
+Support adding/removing stage workers at runtime without restarting the orchestrator. Workers register/deregister via etcd; the orchestrator discovers new instances automatically. Handle in-flight requests gracefully when a worker is removed (drain + re-route).

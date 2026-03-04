@@ -13,20 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Phase 0: Validate that a diffusers pipeline can be split into
+"""Phase 0: Validate that a WanPipeline (video diffusion) can be split into
 Encoder / Denoiser / VAE stages with portable intermediate tensors.
 
 This script runs on a single GPU without Dynamo.  It:
-  1. Generates a reference image with the monolithic pipeline.
+  1. Generates a reference video with the monolithic pipeline.
   2. Runs the same generation in three SEPARATE stages, each loading only
      its own model components, passing serialized tensors between them.
   3. Compares the results to confirm equivalence.
   4. Reports per-stage VRAM usage.
 
 Usage:
-    python validate_split.py \\
-        --model black-forest-labs/FLUX.1-schnell \\
-        --prompt "A photo of a cat" \\
+    python validate_split.py \
+        --model Wan-AI/Wan2.2-TI2V-5B-Diffusers \
+        --prompt "A cat walking on grass" \
         --output-dir /tmp/disagg_validate
 """
 
@@ -73,90 +73,95 @@ def deserialize_tensors(raw: bytes) -> dict:
 # Monolithic baseline
 # ---------------------------------------------------------------------------
 
-def run_monolithic(model_path: str, prompt: str, seed: int, num_steps: int, device: str):
-    from diffusers import FluxPipeline
+def run_monolithic(model_path: str, prompt: str, negative_prompt: str,
+                   seed: int, num_steps: int, num_frames: int,
+                   height: int, width: int, guidance_scale: float,
+                   device: str):
+    from diffusers import WanPipeline, AutoencoderKLWan
 
     logger.info("=== Monolithic Run ===")
     logger.info("Loading full pipeline …")
-    pipe = FluxPipeline.from_pretrained(model_path, torch_dtype=torch.bfloat16)
+
+    vae = AutoencoderKLWan.from_pretrained(
+        model_path, subfolder="vae", torch_dtype=torch.float32
+    )
+    pipe = WanPipeline.from_pretrained(
+        model_path, vae=vae, torch_dtype=torch.bfloat16
+    )
     pipe.to(device)
     logger.info("Full pipeline VRAM: %.0f MB", vram_mb())
 
     generator = torch.Generator(device=device).manual_seed(seed)
-    image = pipe(
+    output = pipe(
         prompt,
+        negative_prompt=negative_prompt,
         num_inference_steps=num_steps,
-        guidance_scale=0.0,
+        guidance_scale=guidance_scale,
         generator=generator,
-        height=512,
-        width=512,
-    ).images[0]
+        height=height,
+        width=width,
+        num_frames=num_frames,
+    )
+    frames = output.frames[0]
 
-    del pipe
+    del pipe, vae
     flush_vram()
-    return image
+    return frames
 
 
 # ---------------------------------------------------------------------------
 # Split stages — each loads ONLY its own components
 # ---------------------------------------------------------------------------
 
-def stage_encoder(model_path: str, prompt: str, device: str) -> bytes:
-    """Stage 1: Load ONLY text encoders, encode prompt, return serialized embeddings."""
-    from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
-    from diffusers import FluxPipeline
+def stage_encoder(model_path: str, prompt: str, negative_prompt: str,
+                  guidance_scale: float, device: str) -> bytes:
+    """Stage 1: Load ONLY text encoder + tokenizer, encode prompt."""
+    from transformers import UMT5EncoderModel, T5TokenizerFast
 
-    logger.info("=== Stage 1: Encoder (text encoders only) ===")
+    logger.info("=== Stage 1: Encoder (text encoder only) ===")
     logger.info("VRAM before load: %.0f MB", vram_mb())
 
-    # Load only the text encoder components
-    tokenizer = CLIPTokenizer.from_pretrained(model_path, subfolder="tokenizer")
-    tokenizer_2 = T5TokenizerFast.from_pretrained(model_path, subfolder="tokenizer_2")
-    text_encoder = CLIPTextModel.from_pretrained(
+    tokenizer = T5TokenizerFast.from_pretrained(model_path, subfolder="tokenizer")
+    text_encoder = UMT5EncoderModel.from_pretrained(
         model_path, subfolder="text_encoder", torch_dtype=torch.bfloat16
     ).to(device)
-    text_encoder_2 = T5EncoderModel.from_pretrained(
-        model_path, subfolder="text_encoder_2", torch_dtype=torch.bfloat16
-    ).to(device)
 
-    logger.info("Text encoders VRAM: %.0f MB", vram_mb())
+    logger.info("Text encoder VRAM: %.0f MB", vram_mb())
 
-    # Build a minimal pipeline just for encode_prompt().
-    # We pass transformer=None and vae=None — FluxPipeline.__init__ stores
-    # them as attributes without validation so this works.
-    from diffusers import FlowMatchEulerDiscreteScheduler
+    do_cfg = guidance_scale > 1.0
 
-    scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-        model_path, subfolder="scheduler"
-    )
-    encoder_pipe = FluxPipeline(
-        scheduler=scheduler,
+    from diffusers import WanPipeline, AutoencoderKLWan
+    from diffusers.schedulers import UniPCMultistepScheduler
+
+    scheduler = UniPCMultistepScheduler.from_pretrained(model_path, subfolder="scheduler")
+    encoder_pipe = WanPipeline(
         tokenizer=tokenizer,
         text_encoder=text_encoder,
-        tokenizer_2=tokenizer_2,
-        text_encoder_2=text_encoder_2,
-        transformer=None,
         vae=None,
+        transformer=None,
+        scheduler=scheduler,
     )
 
-    prompt_embeds, pooled_prompt_embeds, text_ids = encoder_pipe.encode_prompt(
+    prompt_embeds, negative_prompt_embeds = encoder_pipe.encode_prompt(
         prompt=prompt,
-        prompt_2=None,
+        negative_prompt=negative_prompt if do_cfg else None,
+        do_classifier_free_guidance=do_cfg,
+        device=device,
     )
+
     logger.info(
-        "Encoded: prompt_embeds=%s  pooled=%s  text_ids=%s",
+        "Encoded: prompt_embeds=%s  negative_prompt_embeds=%s",
         list(prompt_embeds.shape),
-        list(pooled_prompt_embeds.shape),
-        list(text_ids.shape),
+        list(negative_prompt_embeds.shape) if negative_prompt_embeds is not None else None,
     )
 
-    raw = serialize_tensors({
-        "prompt_embeds": prompt_embeds.cpu(),
-        "pooled_prompt_embeds": pooled_prompt_embeds.cpu(),
-        "text_ids": text_ids.cpu(),
-    })
+    payload = {"prompt_embeds": prompt_embeds.cpu()}
+    if negative_prompt_embeds is not None:
+        payload["negative_prompt_embeds"] = negative_prompt_embeds.cpu()
 
-    del encoder_pipe, text_encoder, text_encoder_2, tokenizer, tokenizer_2
+    raw = serialize_tensors(payload)
+
+    del encoder_pipe, text_encoder, tokenizer
     flush_vram()
     logger.info("VRAM after cleanup: %.0f MB", vram_mb())
     logger.info("Serialized embeddings: %.2f KB", len(raw) / 1024)
@@ -164,120 +169,133 @@ def stage_encoder(model_path: str, prompt: str, device: str) -> bytes:
 
 
 def stage_denoiser(
-    model_path: str, raw_embeddings: bytes, seed: int, num_steps: int, device: str
+    model_path: str, raw_embeddings: bytes, seed: int, num_steps: int,
+    num_frames: int, height: int, width: int, guidance_scale: float,
+    device: str,
 ) -> bytes:
-    """Stage 2: Load ONLY transformer + scheduler, denoise, return serialized latents."""
-    from diffusers import FluxPipeline
+    """Stage 2: Load ONLY transformer + scheduler, denoise, return latents."""
+    from diffusers import WanPipeline, AutoencoderKLWan
 
     logger.info("=== Stage 2: Denoiser (transformer only) ===")
     logger.info("VRAM before load: %.0f MB", vram_mb())
 
-    # Load full pipeline, then immediately discard what we don't need.
-    # (Loading transformer alone and reconstructing a callable pipeline is
-    #  fragile across diffusers versions; this approach is robust.)
-    pipe = FluxPipeline.from_pretrained(model_path, torch_dtype=torch.bfloat16)
+    pipe = WanPipeline.from_pretrained(model_path, torch_dtype=torch.bfloat16)
     pipe.to(device)
 
-    # Read VAE config before deleting
-    vae_scaling_factor = pipe.vae.config.scaling_factor
-    vae_shift_factor = getattr(pipe.vae.config, "shift_factor", None)
+    vae_config = {
+        "latents_mean": pipe.vae.config.latents_mean,
+        "latents_std": pipe.vae.config.latents_std,
+        "z_dim": pipe.vae.config.z_dim,
+        "scale_factor_spatial": pipe.vae.config.scale_factor_spatial,
+        "scale_factor_temporal": pipe.vae.config.scale_factor_temporal,
+    }
 
-    # Delete text encoders + VAE to free VRAM
     pipe.text_encoder = None
-    pipe.text_encoder_2 = None
     pipe.tokenizer = None
-    pipe.tokenizer_2 = None
     pipe.vae = None
     flush_vram()
     logger.info("Denoiser VRAM (transformer only): %.0f MB", vram_mb())
 
     embeddings = deserialize_tensors(raw_embeddings)
     prompt_embeds = embeddings["prompt_embeds"].to(device)
-    pooled_prompt_embeds = embeddings["pooled_prompt_embeds"].to(device)
+    negative_prompt_embeds = embeddings.get("negative_prompt_embeds")
+    if negative_prompt_embeds is not None:
+        negative_prompt_embeds = negative_prompt_embeds.to(device)
 
     generator = torch.Generator(device=device).manual_seed(seed)
 
     result = pipe(
         prompt_embeds=prompt_embeds,
-        pooled_prompt_embeds=pooled_prompt_embeds,
+        negative_prompt_embeds=negative_prompt_embeds,
         num_inference_steps=num_steps,
-        guidance_scale=0.0,
+        guidance_scale=guidance_scale,
         generator=generator,
-        height=512,
-        width=512,
+        height=height,
+        width=width,
+        num_frames=num_frames,
         output_type="latent",
     )
-    latents = result.images
+    latents = result.frames
 
-    logger.info("Latents shape: %s", list(latents.shape))
+    logger.info("Latents shape: %s dtype: %s", list(latents.shape), latents.dtype)
 
     raw = serialize_tensors({
         "latents": latents.cpu(),
-        "scaling_factor": torch.tensor(vae_scaling_factor),
-        "shift_factor": torch.tensor(vae_shift_factor) if vae_shift_factor is not None else None,
+        "vae_config": vae_config,
     })
 
     del pipe
     flush_vram()
     logger.info("VRAM after cleanup: %.0f MB", vram_mb())
-    logger.info("Serialized latents: %.2f KB", len(raw) / 1024)
+    logger.info("Serialized latents: %.2f MB", len(raw) / 1024 / 1024)
     return raw
 
 
 def stage_vae(model_path: str, raw_latents: bytes, device: str):
-    """Stage 3: Load ONLY the VAE, decode latents to an image."""
-    from diffusers import AutoencoderKL
+    """Stage 3: Load ONLY the VAE, decode latents to video frames."""
+    from diffusers import AutoencoderKLWan
+    from diffusers.video_processor import VideoProcessor
 
     logger.info("=== Stage 3: VAE Decode (VAE only) ===")
     logger.info("VRAM before load: %.0f MB", vram_mb())
 
-    vae = AutoencoderKL.from_pretrained(
-        model_path, subfolder="vae", torch_dtype=torch.bfloat16
+    vae = AutoencoderKLWan.from_pretrained(
+        model_path, subfolder="vae", torch_dtype=torch.float32
     )
     vae.to(device)
     logger.info("VAE VRAM: %.0f MB", vram_mb())
 
     data = deserialize_tensors(raw_latents)
     latents = data["latents"].to(device)
-    scaling_factor = data["scaling_factor"].item()
-    shift_factor = data["shift_factor"]
-    if shift_factor is not None:
-        shift_factor = shift_factor.item()
+    vae_config = data["vae_config"]
 
-    if shift_factor is not None:
-        latents = latents / scaling_factor + shift_factor
-    else:
-        latents = latents / scaling_factor
+    latents = latents.to(vae.dtype)
+    latents_mean = (
+        torch.tensor(vae_config["latents_mean"])
+        .view(1, vae_config["z_dim"], 1, 1, 1)
+        .to(latents.device, latents.dtype)
+    )
+    latents_std = (
+        1.0 / torch.tensor(vae_config["latents_std"])
+        .view(1, vae_config["z_dim"], 1, 1, 1)
+        .to(latents.device, latents.dtype)
+    )
+    latents = latents / latents_std + latents_mean
 
     with torch.no_grad():
-        decoded = vae.decode(latents, return_dict=False)[0]
+        video = vae.decode(latents, return_dict=False)[0]
 
-    decoded = (decoded / 2 + 0.5).clamp(0, 1)
-    decoded = decoded.cpu().permute(0, 2, 3, 1).float().numpy()
-
-    import numpy as np
-    from PIL import Image
-
-    image = Image.fromarray((decoded[0] * 255).round().astype(np.uint8))
+    video_processor = VideoProcessor(vae_scale_factor=vae_config["scale_factor_spatial"])
+    frames = video_processor.postprocess_video(video, output_type="np")
+    frames = frames[0]
 
     del vae
     flush_vram()
     logger.info("VRAM after cleanup: %.0f MB", vram_mb())
-    return image
+    logger.info("Decoded %d frames", len(frames))
+    return frames
 
 
 # ---------------------------------------------------------------------------
 # Comparison
 # ---------------------------------------------------------------------------
 
-def compare_images(img_a, img_b) -> dict:
+def compare_frames(frames_a, frames_b) -> dict:
     import numpy as np
 
-    a = np.array(img_a).astype(float)
-    b = np.array(img_b).astype(float)
+    if len(frames_a) != len(frames_b):
+        return {"match": False, "reason": f"frame count mismatch: {len(frames_a)} vs {len(frames_b)}"}
+
+    a = np.stack([np.array(f) if not isinstance(f, np.ndarray) else f for f in frames_a]).astype(float)
+    b = np.stack([np.array(f) if not isinstance(f, np.ndarray) else f for f in frames_b]).astype(float)
 
     if a.shape != b.shape:
         return {"match": False, "reason": f"shape mismatch: {a.shape} vs {b.shape}"}
+
+    if a.max() <= 1.0:
+        a = a * 255.0
+    if b.max() <= 1.0:
+        b = b * 255.0
 
     diff = np.abs(a - b)
     max_diff = diff.max()
@@ -297,13 +315,19 @@ def compare_images(img_a, img_b) -> dict:
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Validate split diffusion pipeline")
-    parser.add_argument("--model", default="black-forest-labs/FLUX.1-schnell")
-    parser.add_argument("--prompt", default="A photo of a cat sitting on a windowsill")
+    parser = argparse.ArgumentParser(description="Validate split diffusion pipeline (Wan video)")
+    parser.add_argument("--model", default="Wan-AI/Wan2.2-TI2V-5B-Diffusers")
+    parser.add_argument("--prompt", default="A cat walking slowly on green grass in sunshine")
+    parser.add_argument("--negative-prompt", default="Blurry, low quality, distorted")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num-steps", type=int, default=4)
+    parser.add_argument("--num-steps", type=int, default=20)
+    parser.add_argument("--num-frames", type=int, default=17)
+    parser.add_argument("--height", type=int, default=480)
+    parser.add_argument("--width", type=int, default=832)
+    parser.add_argument("--guidance-scale", type=float, default=5.0)
     parser.add_argument("--output-dir", default="/tmp/disagg_validate")
-    parser.add_argument("--skip-monolithic", action="store_true")
+    parser.add_argument("--skip-monolithic", action="store_true",
+                        help="Skip monolithic run (for faster iteration on split logic)")
     parser.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu",
     )
@@ -313,14 +337,18 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Monolithic ───────────────────────────────────────────────────
-    mono_image = None
+    mono_frames = None
     if not args.skip_monolithic:
         t0 = time.monotonic()
-        mono_image = run_monolithic(
-            args.model, args.prompt, args.seed, args.num_steps, args.device
+        mono_frames = run_monolithic(
+            args.model, args.prompt, args.negative_prompt,
+            args.seed, args.num_steps, args.num_frames,
+            args.height, args.width, args.guidance_scale,
+            args.device,
         )
-        logger.info("Monolithic: %.2fs -> %s", time.monotonic() - t0, output_dir / "monolithic.png")
-        mono_image.save(output_dir / "monolithic.png")
+        elapsed = time.monotonic() - t0
+        logger.info("Monolithic: %.2fs, %d frames", elapsed, len(mono_frames))
+        _save_video(mono_frames, output_dir / "monolithic.mp4")
 
     # ── Split ────────────────────────────────────────────────────────
     logger.info("")
@@ -331,23 +359,28 @@ def main():
     t_total = time.monotonic()
 
     t0 = time.monotonic()
-    raw_embeddings = stage_encoder(args.model, args.prompt, args.device)
+    raw_embeddings = stage_encoder(
+        args.model, args.prompt, args.negative_prompt,
+        args.guidance_scale, args.device,
+    )
     t_enc = time.monotonic() - t0
 
     t0 = time.monotonic()
     raw_latents = stage_denoiser(
-        args.model, raw_embeddings, args.seed, args.num_steps, args.device
+        args.model, raw_embeddings, args.seed, args.num_steps,
+        args.num_frames, args.height, args.width,
+        args.guidance_scale, args.device,
     )
     t_den = time.monotonic() - t0
     del raw_embeddings
 
     t0 = time.monotonic()
-    split_image = stage_vae(args.model, raw_latents, args.device)
+    split_frames = stage_vae(args.model, raw_latents, args.device)
     t_vae = time.monotonic() - t0
     del raw_latents
 
     t_split = time.monotonic() - t_total
-    split_image.save(output_dir / "split.png")
+    _save_video(split_frames, output_dir / "split.mp4")
 
     # ── Results ──────────────────────────────────────────────────────
     logger.info("")
@@ -359,15 +392,37 @@ def main():
     logger.info("  VAE:      %.2fs", t_vae)
     logger.info("  Total:    %.2fs", t_split)
 
-    if mono_image is not None:
-        metrics = compare_images(mono_image, split_image)
+    if mono_frames is not None:
+        metrics = compare_frames(mono_frames, split_frames)
         logger.info("  Match:    %s", metrics["match"])
-        logger.info("  Max diff: %.1f   Mean diff: %.2f   PSNR: %.1f dB",
-                     metrics["max_pixel_diff"], metrics["mean_pixel_diff"], metrics["psnr_db"])
+        if "max_pixel_diff" in metrics:
+            logger.info(
+                "  Max diff: %.1f   Mean diff: %.2f   PSNR: %.1f dB",
+                metrics["max_pixel_diff"], metrics["mean_pixel_diff"], metrics["psnr_db"],
+            )
+        elif "reason" in metrics:
+            logger.warning("  Reason: %s", metrics["reason"])
         if not metrics["match"]:
-            logger.warning("Images differ — check outputs visually (bf16 rounding is expected).")
+            logger.warning("Frames differ — check outputs visually (bf16 rounding is expected).")
 
     logger.info("  Output:   %s", output_dir)
+
+
+def _save_video(frames, path):
+    """Save a list of numpy frames as mp4 using diffusers utility."""
+    try:
+        from diffusers.utils import export_to_video
+        export_to_video(frames, str(path), fps=16)
+        logger.info("Saved video: %s (%d frames)", path, len(frames))
+    except Exception as e:
+        logger.warning("Could not save video (%s), saving first frame as PNG instead", e)
+        import numpy as np
+        from PIL import Image
+        frame = frames[0]
+        if isinstance(frame, np.ndarray):
+            if frame.max() <= 1.0:
+                frame = (frame * 255).clip(0, 255).astype(np.uint8)
+            Image.fromarray(frame).save(str(path).replace(".mp4", ".png"))
 
 
 if __name__ == "__main__":

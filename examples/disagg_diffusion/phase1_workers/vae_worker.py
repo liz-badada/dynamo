@@ -1,25 +1,11 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
 
-"""Disaggregated Diffusion — VAE Worker
+"""Disaggregated Diffusion — VAE Worker (NIXL)
 
-Loads only the VAE decoder.  Accepts denoised latents and returns
-the final image as base64-encoded PNG.
-
-Usage:
-    python vae_worker.py --model black-forest-labs/FLUX.1-schnell
+Loads only AutoencoderKLWan. Receives denoised latents from the denoiser
+via NIXL RDMA, decodes to video, returns base64-encoded mp4.
 """
 
 import asyncio
@@ -28,95 +14,110 @@ import io
 import logging
 import os
 import sys
+import tempfile
 
 import numpy as np
 import torch
 import uvloop
-from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from protocol import VAEDecodeRequest, VAEDecodeResponse, b64_to_tensors  # noqa: E402
-
+from protocol import VAEDecodeRequest, VAEDecodeResponse, NixlTensorReceiver  # noqa: E402
 from dynamo.runtime import DistributedRuntime, dynamo_endpoint, dynamo_worker  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-MODEL_PATH = os.environ.get("MODEL_PATH", "black-forest-labs/FLUX.1-schnell")
+MODEL_PATH = os.environ.get("MODEL_PATH", "Wan-AI/Wan2.2-TI2V-5B-Diffusers")
 DEVICE = os.environ.get("DEVICE", "cuda")
 
 
 class VAEStage:
-    """VAE decode stage: latents → image pixels."""
-
     def __init__(self):
         self.vae = None
+        self.receiver = None
 
     def load_model(self):
-        from diffusers import AutoencoderKL
+        from diffusers import AutoencoderKLWan
 
-        logger.info("Loading VAE from %s …", MODEL_PATH)
-        self.vae = AutoencoderKL.from_pretrained(
-            MODEL_PATH, subfolder="vae", torch_dtype=torch.bfloat16
-        )
-        self.vae.to(DEVICE)
-
-        vram = torch.cuda.memory_allocated() / 1e6
-        logger.info("VAE ready — VRAM: %.0f MB", vram)
+        logger.info("Loading VAE from %s", MODEL_PATH)
+        self.vae = AutoencoderKLWan.from_pretrained(
+            MODEL_PATH, subfolder="vae", torch_dtype=torch.float32
+        ).to(DEVICE)
+        self.receiver = NixlTensorReceiver()
+        logger.info("VAE ready — VRAM: %.0f MB", torch.cuda.memory_allocated() / 1e6)
 
     @dynamo_endpoint(VAEDecodeRequest, VAEDecodeResponse)
     async def generate(self, request: VAEDecodeRequest):
-        logger.info("Decoding latents …")
+        logger.info("Decoding latents via NIXL …")
 
-        data = b64_to_tensors(request.latents_b64, DEVICE)
-        latents = data["latents"]
-        scaling_factor = data["scaling_factor"].item()
-        shift_factor = data.get("shift_factor")
-        if shift_factor is not None:
-            shift_factor = shift_factor.item()
-
-        # Undo pipeline's latent scaling
-        if shift_factor is not None:
-            latents = latents / scaling_factor + shift_factor
-        else:
-            latents = latents / scaling_factor
+        tensors, vae_config = await self.receiver.pull(request.transfer_meta, DEVICE)
+        latents = tensors["latents"]
 
         loop = asyncio.get_event_loop()
 
         def _decode():
+            from diffusers.video_processor import VideoProcessor
+
+            lat = latents.to(self.vae.dtype)
+            latents_mean = (
+                torch.tensor(vae_config["latents_mean"])
+                .view(1, vae_config["z_dim"], 1, 1, 1)
+                .to(lat.device, lat.dtype)
+            )
+            latents_std = (
+                1.0 / torch.tensor(vae_config["latents_std"])
+                .view(1, vae_config["z_dim"], 1, 1, 1)
+                .to(lat.device, lat.dtype)
+            )
+            lat = lat / latents_std + latents_mean
             with torch.no_grad():
-                decoded = self.vae.decode(latents, return_dict=False)[0]
-            decoded = (decoded / 2 + 0.5).clamp(0, 1)
-            return decoded.cpu().permute(0, 2, 3, 1).float().numpy()
+                video = self.vae.decode(lat, return_dict=False)[0]
+            processor = VideoProcessor(vae_scale_factor=vae_config["scale_factor_spatial"])
+            return processor.postprocess_video(video, output_type="np")[0]
 
-        pixels = await loop.run_in_executor(None, _decode)
+        frames = await loop.run_in_executor(None, _decode)
 
-        img = Image.fromarray((pixels[0] * 255).round().astype(np.uint8))
+        video_b64 = await loop.run_in_executor(None, _frames_to_mp4_b64, frames)
+
+        logger.info("Decoded — %d frames", len(frames))
+        yield VAEDecodeResponse(video_b64=video_b64, num_frames=len(frames)).model_dump()
+
+
+def _frames_to_mp4_b64(frames) -> str:
+    try:
+        from diffusers.utils import export_to_video
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+            tmp_path = f.name
+        export_to_video(frames, tmp_path, fps=16)
+        with open(tmp_path, "rb") as f:
+            data = f.read()
+        os.unlink(tmp_path)
+        return base64.b64encode(data).decode("ascii")
+    except Exception as e:
+        logger.warning("mp4 failed (%s), encoding first frame as PNG", e)
+        from PIL import Image
+        frame = frames[0]
+        if isinstance(frame, np.ndarray) and frame.max() <= 1.0:
+            frame = (frame * 255).clip(0, 255).astype(np.uint8)
+        img = Image.fromarray(frame) if isinstance(frame, np.ndarray) else frame
         buf = io.BytesIO()
         img.save(buf, format="PNG")
-        image_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-
-        response = VAEDecodeResponse(image_b64=image_b64)
-        logger.info("Decoded — image %dx%d", img.width, img.height)
-        yield response.model_dump()
+        return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-@dynamo_worker()
+@dynamo_worker(enable_nats=False)
 async def worker(runtime: DistributedRuntime):
-    endpoint = runtime.endpoint("disagg_diffusion.vae.generate")
+    ns = runtime.namespace("disagg_diffusion")
+    endpoint = ns.component("vae").endpoint("generate")
 
     stage = VAEStage()
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, stage.load_model)
+    await asyncio.get_event_loop().run_in_executor(None, stage.load_model)
 
-    logger.info("Serving VAE endpoint: disagg_diffusion.vae.generate")
+    logger.info("Serving: disagg_diffusion.vae.generate")
     await endpoint.serve_endpoint(stage.generate)
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s %(message)s")
     uvloop.install()
     asyncio.run(worker())

@@ -1,25 +1,12 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
 
-"""Disaggregated Diffusion — Encoder Worker
+"""Disaggregated Diffusion — Encoder Worker (NIXL)
 
-Loads only the text encoders (CLIP + T5) and serves an endpoint that
-converts text prompts into serialized embeddings.
-
-Usage:
-    python encoder_worker.py --model black-forest-labs/FLUX.1-schnell
+Loads only UMT5 text encoder. Embeddings are registered as NIXL-readable;
+only metadata is returned over RPC. The denoiser pulls the actual tensor
+data via RDMA.
 """
 
 import asyncio
@@ -30,82 +17,81 @@ import sys
 import torch
 import uvloop
 
-# Allow importing protocol.py from the same directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from protocol import EncoderRequest, EncoderResponse, tensors_to_b64  # noqa: E402
-
+from protocol import EncoderRequest, EncoderResponse, NixlTensorSender  # noqa: E402
 from dynamo.runtime import DistributedRuntime, dynamo_endpoint, dynamo_worker  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-MODEL_PATH = os.environ.get("MODEL_PATH", "black-forest-labs/FLUX.1-schnell")
+MODEL_PATH = os.environ.get("MODEL_PATH", "Wan-AI/Wan2.2-TI2V-5B-Diffusers")
 DEVICE = os.environ.get("DEVICE", "cuda")
 
 
 class EncoderStage:
-    """Text encoder stage: CLIP + T5 → embeddings."""
-
     def __init__(self):
         self.pipe = None
+        self.sender = None
 
     def load_model(self):
-        from diffusers import FluxPipeline
+        from transformers import UMT5EncoderModel, T5TokenizerFast
+        from diffusers import WanPipeline
+        from diffusers.schedulers import UniPCMultistepScheduler
 
-        logger.info("Loading text encoders from %s …", MODEL_PATH)
-        self.pipe = FluxPipeline.from_pretrained(
-            MODEL_PATH, torch_dtype=torch.bfloat16
+        logger.info("Loading text encoder from %s", MODEL_PATH)
+        tokenizer = T5TokenizerFast.from_pretrained(MODEL_PATH, subfolder="tokenizer")
+        text_encoder = UMT5EncoderModel.from_pretrained(
+            MODEL_PATH, subfolder="text_encoder", torch_dtype=torch.bfloat16
+        ).to(DEVICE)
+        scheduler = UniPCMultistepScheduler.from_pretrained(MODEL_PATH, subfolder="scheduler")
+        self.pipe = WanPipeline(
+            tokenizer=tokenizer, text_encoder=text_encoder,
+            vae=None, transformer=None, scheduler=scheduler,
         )
-        self.pipe.to(DEVICE)
-
-        # Free transformer + VAE — we only need text encoders
-        self.pipe.transformer = None
-        self.pipe.vae = None
-        torch.cuda.empty_cache()
-
-        vram = torch.cuda.memory_allocated() / 1e6
-        logger.info("Encoder ready — VRAM: %.0f MB (text encoders only)", vram)
+        self.sender = NixlTensorSender()
+        logger.info("Encoder ready — VRAM: %.0f MB", torch.cuda.memory_allocated() / 1e6)
 
     @dynamo_endpoint(EncoderRequest, EncoderResponse)
     async def generate(self, request: EncoderRequest):
         logger.info("Encoding prompt: %.80s…", request.prompt)
+        do_cfg = request.guidance_scale > 1.0
 
         loop = asyncio.get_event_loop()
-        prompt_embeds, pooled_prompt_embeds, text_ids = await loop.run_in_executor(
+        prompt_embeds, negative_prompt_embeds = await loop.run_in_executor(
             None,
-            lambda: self.pipe.encode_prompt(prompt=request.prompt, prompt_2=None),
+            lambda: self.pipe.encode_prompt(
+                prompt=request.prompt,
+                negative_prompt=request.negative_prompt if do_cfg else None,
+                do_classifier_free_guidance=do_cfg,
+                device=DEVICE,
+            ),
         )
 
-        embeddings = {
-            "prompt_embeds": prompt_embeds,
-            "pooled_prompt_embeds": pooled_prompt_embeds,
-            "text_ids": text_ids,
-        }
+        payload = {"prompt_embeds": prompt_embeds}
+        if negative_prompt_embeds is not None:
+            payload["negative_prompt_embeds"] = negative_prompt_embeds
 
-        response = EncoderResponse(
-            embeddings_b64=tensors_to_b64(embeddings),
-            shapes={k: list(v.shape) for k, v in embeddings.items()},
-        )
-        logger.info("Encoded — prompt_embeds %s", list(prompt_embeds.shape))
-        yield response.model_dump()
+        transfer_meta = await self.sender.prepare(payload)
+
+        shapes = {k: list(v.shape) for k, v in payload.items()}
+        logger.info("Encoded — shapes %s, yielding NIXL metadata", shapes)
+
+        yield EncoderResponse(transfer_meta=transfer_meta, shapes=shapes).model_dump()
 
 
-@dynamo_worker()
+@dynamo_worker(enable_nats=False)
 async def worker(runtime: DistributedRuntime):
-    endpoint = runtime.endpoint("disagg_diffusion.encoder.generate")
+    ns = runtime.namespace("disagg_diffusion")
+    endpoint = ns.component("encoder").endpoint("generate")
 
     stage = EncoderStage()
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, stage.load_model)
+    await asyncio.get_event_loop().run_in_executor(None, stage.load_model)
 
-    logger.info("Serving encoder endpoint: disagg_diffusion.encoder.generate")
+    logger.info("Serving: disagg_diffusion.encoder.generate")
     await endpoint.serve_endpoint(stage.generate)
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s %(message)s")
     uvloop.install()
     asyncio.run(worker())
