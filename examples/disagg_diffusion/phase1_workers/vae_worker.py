@@ -5,18 +5,16 @@
 """Disaggregated Diffusion — VAE Worker (NIXL)
 
 Loads only AutoencoderKLWan. Receives denoised latents from the denoiser
-via NIXL RDMA, decodes to video, returns base64-encoded mp4.
+via NIXL RDMA, decodes to video, writes mp4 to shared storage.
+Only the file path is returned over RPC (not the video bytes).
 """
 
 import asyncio
-import base64
-import io
 import logging
 import os
 import sys
-import tempfile
+import uuid
 
-import numpy as np
 import torch
 import uvloop
 
@@ -29,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 MODEL_PATH = os.environ.get("MODEL_PATH", "Wan-AI/Wan2.2-TI2V-5B-Diffusers")
 DEVICE = os.environ.get("DEVICE", "cuda")
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/tmp/disagg_videos")
 
 
 class VAEStage:
@@ -44,6 +43,17 @@ class VAEStage:
             MODEL_PATH, subfolder="vae", torch_dtype=torch.float32
         ).to(DEVICE)
         self.receiver = NixlTensorReceiver()
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        logger.info("VAE loaded — VRAM: %.0f MB", torch.cuda.memory_allocated() / 1e6)
+
+        # Warmup: run a tiny decode to trigger CUDA kernel compilation.
+        logger.info("Running warmup decode …")
+        _z_dim = self.vae.config.z_dim
+        _dummy = torch.randn(1, _z_dim, 2, 4, 4, device=DEVICE, dtype=self.vae.dtype)
+        with torch.no_grad():
+            self.vae.decode(_dummy, return_dict=False)
+        del _dummy
+        torch.cuda.empty_cache()
         logger.info("VAE ready — VRAM: %.0f MB", torch.cuda.memory_allocated() / 1e6)
 
     @dynamo_endpoint(VAEDecodeRequest, VAEDecodeResponse)
@@ -77,32 +87,31 @@ class VAEStage:
 
         frames = await loop.run_in_executor(None, _decode)
 
-        video_b64 = await loop.run_in_executor(None, _frames_to_mp4_b64, frames)
+        # Write mp4 directly to shared storage — no base64 over RPC.
+        request_id = request.request_id or str(uuid.uuid4())[:8]
+        filename = f"{request_id}.mp4"
+        filepath = os.path.join(OUTPUT_DIR, filename)
+        await loop.run_in_executor(None, _save_video, frames, filepath)
 
-        logger.info("Decoded — %d frames", len(frames))
-        yield VAEDecodeResponse(video_b64=video_b64, num_frames=len(frames)).model_dump()
+        logger.info("Decoded — %d frames → %s", len(frames), filepath)
+        yield VAEDecodeResponse(video_path=filename, num_frames=len(frames)).model_dump()
 
 
-def _frames_to_mp4_b64(frames) -> str:
+def _save_video(frames, filepath: str):
+    """Save frames as mp4. Falls back to PNG if ffmpeg is unavailable."""
     try:
         from diffusers.utils import export_to_video
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
-            tmp_path = f.name
-        export_to_video(frames, tmp_path, fps=16)
-        with open(tmp_path, "rb") as f:
-            data = f.read()
-        os.unlink(tmp_path)
-        return base64.b64encode(data).decode("ascii")
+        export_to_video(frames, filepath, fps=16)
     except Exception as e:
-        logger.warning("mp4 failed (%s), encoding first frame as PNG", e)
+        logger.warning("mp4 export failed (%s), saving first frame as PNG", e)
+        import numpy as np
         from PIL import Image
         frame = frames[0]
         if isinstance(frame, np.ndarray) and frame.max() <= 1.0:
             frame = (frame * 255).clip(0, 255).astype(np.uint8)
         img = Image.fromarray(frame) if isinstance(frame, np.ndarray) else frame
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        return base64.b64encode(buf.getvalue()).decode("ascii")
+        png_path = filepath.replace(".mp4", ".png")
+        img.save(png_path)
 
 
 @dynamo_worker(enable_nats=False)

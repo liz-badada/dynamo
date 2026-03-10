@@ -39,25 +39,58 @@ class DenoiserStage:
 
     def load_model(self):
         from diffusers import WanPipeline
+        from diffusers.models import WanTransformer3DModel
+        from diffusers.schedulers import UniPCMultistepScheduler
 
         logger.info("Loading transformer from %s", MODEL_PATH)
-        self.pipe = WanPipeline.from_pretrained(MODEL_PATH, torch_dtype=torch.bfloat16)
-        self.pipe.to(DEVICE)
 
+        # Load only the transformer + scheduler — avoid loading text encoder
+        # and VAE onto GPU (saves ~14 GB VRAM and speeds up startup).
+        transformer = WanTransformer3DModel.from_pretrained(
+            MODEL_PATH, subfolder="transformer", torch_dtype=torch.bfloat16
+        ).to(DEVICE)
+        scheduler = UniPCMultistepScheduler.from_pretrained(
+            MODEL_PATH, subfolder="scheduler"
+        )
+
+        # Read VAE config without loading weights — only need 5 scalar values
+        # for latent normalization in the VAE decode stage.
+        from diffusers import AutoencoderKLWan
+        vae_config_obj = AutoencoderKLWan.load_config(MODEL_PATH, subfolder="vae")
         self.vae_config = {
-            "latents_mean": self.pipe.vae.config.latents_mean,
-            "latents_std": self.pipe.vae.config.latents_std,
-            "z_dim": self.pipe.vae.config.z_dim,
-            "scale_factor_spatial": self.pipe.vae.config.scale_factor_spatial,
-            "scale_factor_temporal": self.pipe.vae.config.scale_factor_temporal,
+            "latents_mean": vae_config_obj["latents_mean"],
+            "latents_std": vae_config_obj["latents_std"],
+            "z_dim": vae_config_obj["z_dim"],
+            "scale_factor_spatial": vae_config_obj.get("scale_factor_spatial", 8),
+            "scale_factor_temporal": vae_config_obj.get("scale_factor_temporal", 4),
         }
-        self.pipe.text_encoder = None
-        self.pipe.tokenizer = None
-        self.pipe.vae = None
-        torch.cuda.empty_cache()
+
+        self.pipe = WanPipeline(
+            tokenizer=None, text_encoder=None, vae=None,
+            transformer=transformer, scheduler=scheduler,
+        )
 
         self.receiver = NixlTensorReceiver()
         self.sender = NixlTensorSender()
+        logger.info("Denoiser loaded — VRAM: %.0f MB", torch.cuda.memory_allocated() / 1e6)
+
+        # Warmup: run a tiny denoising pass to trigger CUDA kernel compilation.
+        logger.info("Running warmup denoise (1 step) …")
+        _warmup_h, _warmup_w, _warmup_f = 128, 128, 5
+        _dummy_embeds = torch.randn(1, 1, transformer.config.in_channels if hasattr(transformer.config, "in_channels") else 4096, device=DEVICE, dtype=torch.bfloat16)
+        try:
+            self.pipe(
+                prompt_embeds=_dummy_embeds,
+                negative_prompt_embeds=None,
+                num_inference_steps=1,
+                guidance_scale=1.0,
+                height=_warmup_h, width=_warmup_w,
+                num_frames=_warmup_f,
+                output_type="latent",
+            )
+        except Exception as e:
+            logger.warning("Warmup denoise failed (non-critical): %s", e)
+        torch.cuda.empty_cache()
         logger.info("Denoiser ready — VRAM: %.0f MB", torch.cuda.memory_allocated() / 1e6)
 
     @dynamo_endpoint(DenoiserRequest, DenoiserResponse)

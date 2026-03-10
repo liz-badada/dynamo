@@ -68,9 +68,27 @@ Three Dynamo workers with NIXL RDMA tensor transfer:
 | `denoiser_worker.py` | WanTransformer3DModel | ~10 GB | `disagg_diffusion.denoiser.generate` |
 | `vae_worker.py` | AutoencoderKLWan (fp32) | ~3 GB | `disagg_diffusion.vae.generate` |
 
-### Phase 2: Orchestrator
+### Phase 2: Orchestrator (Pipeline Parallel)
 
-Chains three stage endpoints. Only NIXL metadata (~1.5 KB) passes through RPC.
+Chains three stage endpoints with pipeline parallelism. Multiple concurrent
+requests overlap across stages — while request 1 is in the Denoiser, request 2
+can run in the Encoder simultaneously:
+
+```
+Request 1:  [Encoder] → [Denoiser] → [  VAE  ]
+Request 2:             [Encoder] → [Denoiser] → [  VAE  ]
+Request 3:                        [Encoder] → [Denoiser] → ...
+```
+
+Key features:
+- **Per-stage semaphores** — one GPU per stage, backpressure via `asyncio.Semaphore(1)`
+- **Admission control** — `MAX_PIPELINE_DEPTH` (default 4) limits total in-flight requests
+- **No base64 over RPC** — VAE writes mp4 to shared storage, only the filename goes over RPC
+- **Pipeline status** — `GET /pipeline/status` shows per-stage utilization
+
+Environment variables:
+- `MAX_PIPELINE_DEPTH` — max concurrent requests in pipeline (default: 4)
+- `OUTPUT_DIR` — shared directory for video output (default: `/tmp/disagg_videos`)
 
 ## Results
 

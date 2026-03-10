@@ -19,6 +19,33 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# NIXL persistent connector
+# ---------------------------------------------------------------------------
+# UCX endpoints are pooled at the process level. When a Connection (NIXL
+# agent) is destroyed, its UCX resources are returned to the pool in a
+# stale state, which corrupts subsequent connections.
+#
+# A PersistentConnector reuses a single Connection for all operations,
+# keeping the UCX transport alive across requests. Remote._release() is
+# left intact so old remote-agent references are properly cleaned up
+# (remove_remote_agent only drops metadata, not the UCX transport, when
+# the local agent is persistent).
+
+class _PersistentConnector(nixl_connect.Connector):
+    """Connector that reuses a single NIXL Connection (agent) for all ops."""
+
+    def __init__(self):
+        super().__init__()
+        self._persistent_connection = None
+
+    async def _create_connection(self) -> nixl_connect.Connection:
+        if self._persistent_connection is None:
+            self._persistent_connection = nixl_connect.Connection(self, 1)
+            await self._persistent_connection.initialize()
+        return self._persistent_connection
+
+
+# ---------------------------------------------------------------------------
 # NIXL sender / receiver
 # ---------------------------------------------------------------------------
 
@@ -31,8 +58,8 @@ class NixlTensorSender:
     """
 
     def __init__(self):
-        self._connector = nixl_connect.Connector()
-        self._pending_task: Optional[Any] = None
+        self._connector = _PersistentConnector()
+        self._pending_tasks: list = []
 
     async def prepare(
         self,
@@ -46,6 +73,9 @@ class NixlTensorSender:
         then return — no need to await anything.
         """
         import asyncio
+
+        # Clean up completed tasks to avoid unbounded growth.
+        self._pending_tasks = [t for t in self._pending_tasks if not t.done()]
 
         flat = torch.cat([t.contiguous().view(-1) for t in tensors.values()])
         descriptor = nixl_connect.Descriptor(flat)
@@ -67,7 +97,8 @@ class NixlTensorSender:
             except Exception as e:
                 logger.warning("NIXL readable wait failed: %s", e)
 
-        self._pending_task = asyncio.ensure_future(_keep_alive())
+        task = asyncio.ensure_future(_keep_alive())
+        self._pending_tasks.append(task)
         return meta_dict
 
 
@@ -75,10 +106,14 @@ class NixlTensorReceiver:
     """Pulls tensors from a remote sender via NIXL RDMA."""
 
     def __init__(self):
-        self._connector = nixl_connect.Connector()
+        self._connector = _PersistentConnector()
 
     async def pull(self, meta: dict, device: str = "cuda") -> tuple:
-        """Pull tensors described by meta. Returns (tensors_dict, extra_dict)."""
+        """Pull tensors described by meta. Returns (tensors_dict, extra_dict).
+
+        Allocates the receive buffer directly on the target device so that
+        NIXL RDMA writes land on GPU memory without an extra CPU→GPU copy.
+        """
         total_bytes = 0
         specs = []
         for key in meta["tensor_keys"]:
@@ -91,7 +126,8 @@ class NixlTensorReceiver:
             specs.append((key, shape, dtype, size))
             total_bytes += size
 
-        flat = torch.empty(total_bytes, dtype=torch.uint8, device="cpu")
+        # Allocate directly on the target device for GPU-direct RDMA.
+        flat = torch.empty(total_bytes, dtype=torch.uint8, device=device)
         descriptor = nixl_connect.Descriptor(flat)
 
         rdma_meta = nixl_connect.RdmaMetadata.model_validate(meta["nixl_metadata"])
@@ -101,8 +137,7 @@ class NixlTensorReceiver:
         result = {}
         offset = 0
         for key, shape, dtype, size in specs:
-            t = flat[offset : offset + size].view(dtype=dtype).reshape(shape)
-            result[key] = t.to(device)
+            result[key] = flat[offset : offset + size].view(dtype=dtype).reshape(shape)
             offset += size
 
         return result, meta.get("extra", {})
@@ -148,10 +183,11 @@ class DenoiserResponse(BaseModel):
 
 class VAEDecodeRequest(BaseModel):
     transfer_meta: Dict[str, Any]
+    request_id: str = ""
 
 
 class VAEDecodeResponse(BaseModel):
-    video_b64: str = ""
+    video_path: str = ""
     num_frames: int = 0
 
 

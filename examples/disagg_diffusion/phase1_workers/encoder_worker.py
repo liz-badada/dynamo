@@ -49,6 +49,16 @@ class EncoderStage:
             vae=None, transformer=None, scheduler=scheduler,
         )
         self.sender = NixlTensorSender()
+        logger.info("Encoder loaded — VRAM: %.0f MB", torch.cuda.memory_allocated() / 1e6)
+
+        # Warmup: run one encode to trigger CUDA kernel JIT compilation.
+        logger.info("Running warmup encode …")
+        self.pipe.encode_prompt(
+            prompt="warmup",
+            negative_prompt=None,
+            do_classifier_free_guidance=False,
+            device=DEVICE,
+        )
         logger.info("Encoder ready — VRAM: %.0f MB", torch.cuda.memory_allocated() / 1e6)
 
     @dynamo_endpoint(EncoderRequest, EncoderResponse)

@@ -130,7 +130,7 @@ def stage_encoder(model_path: str, prompt: str, negative_prompt: str,
 
     do_cfg = guidance_scale > 1.0
 
-    from diffusers import WanPipeline, AutoencoderKLWan
+    from diffusers import WanPipeline
     from diffusers.schedulers import UniPCMultistepScheduler
 
     scheduler = UniPCMultistepScheduler.from_pretrained(model_path, subfolder="scheduler")
@@ -174,7 +174,7 @@ def stage_denoiser(
     device: str,
 ) -> bytes:
     """Stage 2: Load ONLY transformer + scheduler, denoise, return latents."""
-    from diffusers import WanPipeline, AutoencoderKLWan
+    from diffusers import WanPipeline
 
     logger.info("=== Stage 2: Denoiser (transformer only) ===")
     logger.info("VRAM before load: %.0f MB", vram_mb())
