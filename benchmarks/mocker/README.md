@@ -1,5 +1,31 @@
 # Mocker AIC callback benchmark
 
+## Replay an AIC AFD sweep with MTP
+
+The Mocker can replay an AIC-selected service point without estimating its
+attention or MoE kernels again. The AIC-side adapter writes a standard
+`planner_profile_data` NPZ with the selected raw decode-round time, then invokes
+`python -m dynamo.replay` with the selected worker count, concurrency, and MTP
+acceptance model.
+
+From the AIC checkout, run:
+
+```bash
+uv run python tools/afd_multimodel_mtp_mocker_replay.py \
+  --sweep /path/to/measured_only_sweep.json \
+  --dynamo /path/to/this/dynamo/checkout \
+  --output-dir /path/to/mocker_replay \
+  --models qwen3_235b minimax_m25 minimax_m3 \
+  --workloads 8k 16k \
+  --total-gpus 16 24 36 48 72
+```
+
+This path uses the existing `planner_profile_data`, `aic_nextn`,
+`aic_nextn_accept_rates`, and `aic_mtp_seed` contracts. Mocker validates
+replication, routing, finite-wave effects, request lifecycle, and MTP burst
+accounting. It does not replace the AIC kernel-time simulation or a measured
+MoE-stage profile.
+
 These benchmarks demonstrate the benefit the AIC Rust core (aiconfigurator #1200)
 delivers to its consumer, the Dynamo mocker: they compare the mocker driving the
 Rust crate (`RustAicCallback`, wrapping `aiconfigurator_core::AicEngine`) against
