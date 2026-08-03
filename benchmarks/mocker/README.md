@@ -29,7 +29,7 @@ uv run python tools/afd_multimodel_mtp_mocker_replay.py \
   --sweep /path/to/measured_only_sweep.json \
   --dynamo /path/to/this/dynamo/checkout \
   --output-dir /path/to/mocker_replay \
-  --models qwen3_235b minimax_m25 minimax_m3 \
+  --models qwen3_235b minimax_m25 minimax_m3 deepseek_v4_flash deepseek_v4_pro \
   --workloads 8k 16k \
   --total-gpus 16 24 36 48 72
 ```
