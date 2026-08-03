@@ -40,6 +40,11 @@ replication, routing, finite-wave effects, request lifecycle, and MTP burst
 accounting. It does not replace the AIC kernel-time simulation or a measured
 MoE-stage profile.
 
+The adapter's default single wave includes fill, drain, and the stochastic MTP
+tail. For a steady-state convergence check, select one model/workload/GPU point
+and add `--output-tokens 128 --waves 64`. Compare TPOT first; finite-wave output
+throughput can remain below AIC's saturated reference even when timing agrees.
+
 These benchmarks demonstrate the benefit the AIC Rust core (aiconfigurator #1200)
 delivers to its consumer, the Dynamo mocker: they compare the mocker driving the
 Rust crate (`RustAicCallback`, wrapping `aiconfigurator_core::AicEngine`) against
