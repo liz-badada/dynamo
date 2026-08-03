@@ -8,6 +8,20 @@ attention or MoE kernels again. The AIC-side adapter writes a standard
 `python -m dynamo.replay` with the selected worker count, concurrency, and MTP
 acceptance model.
 
+Build the Rust Python binding after switching branches. Reusing an `_core`
+binary from another commit can leave the Python and Rust replay signatures out
+of sync.
+
+```bash
+uv sync --extra mocker
+source .venv/bin/activate
+uv pip install 'maturin[patchelf]'
+(cd lib/bindings/python && maturin develop --uv)
+```
+
+The binding build requires the Rust toolchain and `protoc`; see
+`lib/bindings/python/README.md`.
+
 From the AIC checkout, run:
 
 ```bash
