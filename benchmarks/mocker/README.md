@@ -30,7 +30,7 @@ uv run python tools/afd_multimodel_mtp_mocker_replay.py \
   --dynamo /path/to/this/dynamo/checkout \
   --output-dir /path/to/mocker_replay \
   --models qwen3_235b minimax_m25 minimax_m3 deepseek_v4_flash deepseek_v4_pro \
-  --workloads 8k 16k \
+  --workloads 8k 16k 32k 64k 128k 256k 512k 1m \
   --total-gpus 16 24 36 48 72
 ```
 
@@ -39,6 +39,11 @@ This path uses the existing `planner_profile_data`, `aic_nextn`,
 replication, routing, finite-wave effects, request lifecycle, and MTP burst
 accounting. It does not replace the AIC kernel-time simulation or a measured
 MoE-stage profile.
+
+This replay is decode-only. The NPZ still contains a prefill curve because
+Mocker needs to initialize request/KV state, but the adapter defaults that
+synthetic prefill event to `0 ms`; it is not a TTFT estimate. Use
+`--synthetic-prefill-ms` only for an explicitly labeled sensitivity run.
 
 The adapter's default single wave includes fill, drain, and the stochastic MTP
 tail. For a steady-state convergence check, select one model/workload/GPU point
